@@ -1,0 +1,438 @@
+---
+title: "HR Employee Attrition: Decision Tree & Neural Network Classification"
+author: "Tsitsi nyamayaro"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Introduction
+
+> **Decision Trees** are considered to be an efficient way to make decisions or solve problems under uncertainty by evaluating each option based on the expected outcome and comparing options based on these expected outcomes. The final decision is usually based on a set of criteria and alternate paths available during the decision-making process. This can be applied to any situation with a simple outcome, such as yes/no, or a continuous output, such as how much money is involved. Decision trees are visual models that enable us to visually present all of the options associated with a problem and describe each option based on a probability value assigned to each choice outcome of a specific decision, including a group of related options. Each option's value is determined by the probability value assigned to each expected outcome. The decision trees represent the relationship between choices and outcomes by drawing prospective decisions in a hierarchy. The decision tree is a branched flowchart that depicts multiple potential decision and outcome pathways.
+
+> **Decision Tree Structure**: The tree begins with a decision node (or root node), which indicates that a decision must be made. A branch is created from the decision node for each of the alternative choices under consideration. If the initial decision leads to another decision, a new decision node is created, and new branches are added to show each alternative pathway for the new decision. As a result, a series of decision pathways emerge. The flowchart may consist of only one or two decisions with one or two alternatives, or it may consist of a complex sequence of many decisions with many alternatives at each node.
+
+> **Problem Statement**: In this analysis, we attempt to look from the perspective of an employee to determine what decision the employee at an organization would make based on the current situation. How likely is it that the employee will continue to work for the organization based on historical data? We approach this problem using two classification methods: (1) Decision Trees and (2) Neural Networks, and compare their performance.
+
+---
+
+# Required Libraries
+
+```{r libraries}
+# Decision Tree libraries
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+
+# Data manipulation
+library(dplyr)
+library(tidyr)
+
+# Neural Network libraries
+# Ensure keras3 and a backend (tensorflow or torch) are installed:
+# install.packages("keras3")
+# keras3::install_keras(backend = "tensorflow")
+library(keras3)
+
+# ROC / AUC evaluation
+# install.packages("pROC")
+library(pROC)
+```
+
+---
+
+# Data Loading & Preprocessing
+
+## Load the HR Dataset
+
+```{r load-data}
+hr <- read.csv("11_HR_comma_sep.csv")
+cat("Dataset dimensions:", nrow(hr), "rows x", ncol(hr), "columns\n")
+head(hr)
+```
+
+The dataset contains `r nrow(hr)` employee records across `r ncol(hr)` features including satisfaction level, last evaluation score, number of projects, average monthly hours, tenure, work accidents, promotions, department, and salary level. The target variable `left` indicates whether an employee departed the company (1) or stayed (0).
+
+---
+
+# Part 1: Decision Tree Classification
+
+## Exploratory Data Analysis
+
+For the Decision Tree, we convert the target variable `left` from a numeric binary flag to a descriptive factor to improve readability of the tree visualization.
+
+```{r dt-prep}
+hr_dt <- hr
+hr_dt$left <- ifelse(hr_dt$left == 1, "left", "not_left")
+cat("Target distribution:\n")
+table(hr_dt$left)
+```
+
+### Random Sample Scatter Plot
+
+We visualize a random sample of 20 employees, plotting satisfaction level against last evaluation score, colored by departure status. A vertical line at `satisfaction_level = 0.30` highlights a natural threshold often used in the first decision split.
+
+```{r eda-plot, fig.width=7, fig.height=5}
+set.seed(1234)
+random_sample <- sample(seq(1, nrow(hr_dt)), 20)
+hr_sample <- hr_dt[random_sample, ]
+
+ggplot(hr_sample) +
+  geom_point(aes(x = satisfaction_level,
+                 y = last_evaluation,
+                 col = left),
+             size = 3) +
+  geom_vline(xintercept = 0.30,
+             col = "purple",
+             linewidth = 1) +
+  labs(title = "Satisfaction Level vs. Last Evaluation (Sample of 20)",
+       x = "Satisfaction Level",
+       y = "Last Evaluation Score",
+       color = "Employee Status") +
+  theme_minimal()
+```
+
+---
+
+## Gini Impurity
+
+Before building the tree, we calculate the Gini Impurity for the 20-record sample. From the sample, we observe roughly 40% left and 60% not_left, giving class probabilities of (0.4, 0.6).
+
+```{r gini}
+class_probs <- c(0.4, 0.6)
+gini_impurity <- 1 - sum(class_probs^2)
+cat("Gini Impurity:", round(gini_impurity, 4), "\n")
+```
+
+> **Gini Impurity** is a measurement used to build Decision Trees to determine how features of a dataset should split nodes to form the tree.
+>
+> - The range of Gini Impurity: [0, 1 − (1/n)], where n is the number of classes. For binary classification, the maximum is **0.5**. Lower is better.
+> - A Gini Impurity of 0.5 for binary classification means equal representation — values are evenly split between classes with no predictive signal.
+>
+> **Entropy vs. Gini Impurity**: Both measure "disorder" or "impurity" in a dataset.
+>
+> - **Entropy** (from Shannon Information Theory) measures the average amount of "information" or "surprise" produced by the set of outcomes:
+> $$Entropy = - \sum_{i=1}^{n} p_i \log_2(p_i)$$
+>   - Max Value: 1.0 (binary classification). Slower to compute (requires logarithms).
+> - **In Neural Networks**, we use *Cross-Entropy Loss* — it doesn't just care if the model is right or wrong; it cares **how confident** the model was. Predicting 99% probability for the wrong class incurs a much higher penalty than predicting 51%.
+
+---
+
+## Train / Test Split
+
+```{r dt-split}
+set.seed(1234)
+train_test <- sample(c(0, 1), nrow(hr_dt),
+                     prob = c(0.8, 0.2),
+                     replace = TRUE)
+
+hr_train <- hr_dt[train_test == 0, ]
+hr_test  <- hr_dt[train_test == 1, ]
+
+cat("Training set size:", nrow(hr_train), "\n")
+cat("Test set size:    ", nrow(hr_test), "\n")
+```
+
+---
+
+## Default Decision Tree (Full Complexity)
+
+We train a classification tree using all available features with default complexity parameter settings.
+
+```{r dt-full, fig.width=10, fig.height=7}
+hr_tree <- rpart(left ~ .,
+                 method = "class",
+                 data = hr_train)
+
+rpart.plot(hr_tree,
+           main = "Decision Tree: HR Employee Attrition (Default cp)",
+           type = 4,
+           extra = 104)
+```
+
+### Complexity Parameter (cp) Table
+
+> The **complexity parameter (cp)** is a threshold used to prune the tree. Any split that does not improve the overall fit (reduce relative error) by at least the factor `cp` is not attempted.
+>
+> - **Smaller cp** (e.g., 0.001): Allows a very deep, complex tree — captures more detail but risks **overfitting**.
+> - **Larger cp** (e.g., 0.1): Results in a smaller, simpler tree — more interpretable but risks **underfitting**.
+
+```{r dt-cp}
+printcp(hr_tree)
+```
+
+---
+
+## Exploring Decision Splits Manually
+
+We verify the first two splits the tree identified as most informative.
+
+```{r dt-splits}
+# First split: satisfaction_level < 0.47
+cat("--- First Split: satisfaction_level < 0.47 ---\n")
+hr_train %>%
+  filter(satisfaction_level < 0.47) %>%
+  count(left)
+
+# Second split: (satisfaction_level < 0.47) AND (number_project < 3)
+cat("\n--- Second Split: satisfaction_level < 0.47 AND number_project < 3 ---\n")
+hr_train %>%
+  filter((satisfaction_level < 0.47) & (number_project < 3)) %>%
+  count(left)
+```
+
+---
+
+## Pruned Decision Tree (cp = 0.02)
+
+A pruned tree with `cp = 0.02` reduces complexity while retaining meaningful splits.
+
+```{r dt-pruned, fig.width=9, fig.height=6}
+hr_tree1 <- rpart(left ~ .,
+                  data = hr_train,
+                  method = "class",
+                  control = rpart.control(cp = 0.02))
+
+rpart.plot(hr_tree1,
+           main = "Decision Tree: HR Employee Attrition (cp = 0.02)",
+           type = 4,
+           extra = 104)
+```
+
+```{r dt-pruned-cp}
+printcp(hr_tree1)
+```
+
+---
+
+## Prediction & Evaluation (Decision Tree)
+
+### Predictions on Test Set
+
+```{r dt-predict}
+predictions_dt <- predict(hr_tree, hr_test, type = "class")
+head(predictions_dt)
+```
+
+### Confusion Matrix
+
+```{r dt-confusion}
+Confusion_matrix <- table(Actual = hr_test$left, Predicted = predictions_dt)
+Confusion_matrix
+```
+
+### Accuracy Calculation
+
+```{r dt-accuracy}
+Confusion_df <- as.data.frame(Confusion_matrix)
+colnames(Confusion_df) <- c("true_outcome", "predicted_outcome", "frequency")
+
+Accuracy_dt <- sum(Confusion_df[
+  Confusion_df$true_outcome == Confusion_df$predicted_outcome, "frequency"]) /
+  sum(Confusion_df$frequency)
+
+cat("Decision Tree Accuracy:", round(Accuracy_dt * 100, 2), "%\n")
+```
+
+---
+
+# Part 2: Neural Network Classification (Keras)
+
+Neural Networks use **Hidden Layers** (`layer_dense`) that act as a black box — they create complex, non-linear combinations of variables (e.g., combining satisfaction level, monthly hours, and tenure into abstract "scores") to find patterns that a simple decision tree might miss.
+
+## Data Preprocessing for Neural Network
+
+Neural Networks require: (1) a **numeric** target variable, (2) **one-hot encoded** categorical features, and (3) **scaled** input features.
+
+```{r nn-prep}
+hr_nn <- read.csv("11_HR_comma_sep.csv")
+# Note: For Keras, the target stays numeric (1 = left, 0 = not_left)
+y_label <- hr_nn$left
+
+# Remove the target from input features
+hr_features <- hr_nn %>% select(-left)
+
+cat("Class distribution in target:\n")
+table(y_label)
+```
+
+### One-Hot Encoding of Categorical Variables
+
+The HR dataset contains two categorical columns: `sales` (department) and `salary` (low/medium/high). We use `model.matrix()` to produce the required dummy variables.
+
+```{r nn-onehot}
+hr_numeric <- model.matrix(~ . - 1, data = hr_features)
+cat("Feature matrix dimensions after encoding:", dim(hr_numeric), "\n")
+cat("Columns:", colnames(hr_numeric), "\n")
+```
+
+### Min-Max Normalization
+
+Scaling is essential for Neural Networks — without it, features with large ranges (e.g., `average_montly_hours`: 100–300) dominate features with small ranges (e.g., `satisfaction_level`: 0–1), causing unstable training.
+
+```{r nn-scale}
+maxs <- apply(hr_numeric, 2, max)
+mins <- apply(hr_numeric, 2, min)
+hr_scaled <- as.data.frame(scale(hr_numeric, center = mins, scale = maxs - mins))
+cat("Scaled feature range check (first column):",
+    round(min(hr_scaled[, 1]), 4), "to",
+    round(max(hr_scaled[, 1]), 4), "\n")
+```
+
+## Train / Test Split (Neural Network)
+
+```{r nn-split}
+set.seed(1234)
+index <- sample(c("train", "test"), nrow(hr_scaled),
+                replace = TRUE, prob = c(0.8, 0.2))
+
+x_train <- as.matrix(hr_scaled[index == "train", ])
+y_train <- as.matrix(y_label[index == "train"])
+x_test  <- as.matrix(hr_scaled[index == "test", ])
+y_test  <- as.matrix(y_label[index == "test"])
+
+cat("Training samples:", nrow(x_train), "\n")
+cat("Test samples:    ", nrow(x_test),  "\n")
+cat("Input features:  ", ncol(x_train), "\n")
+```
+
+---
+
+## Build the Neural Network Architecture
+
+We use a sequential model with two hidden layers using **ReLU** activation and a final output layer with **Sigmoid** activation for binary classification.
+
+| Layer | Units | Activation | Purpose |
+|-------|-------|------------|---------|
+| Hidden Layer 1 | 32 | ReLU | Learn complex feature combinations |
+| Hidden Layer 2 | 16 | ReLU | Refine representations |
+| Output Layer | 1 | Sigmoid | Output probability of leaving (0–1) |
+
+```{r nn-model}
+model <- keras_model_sequential(input_shape = ncol(x_train)) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 16, activation = "relu") %>%
+  layer_dense(units = 1,  activation = "sigmoid")
+
+summary(model)
+```
+
+---
+
+## Compile and Train
+
+```{r nn-compile-fit}
+model %>% compile(
+  optimizer = "adam",
+  loss      = "binary_crossentropy",
+  metrics   = c("accuracy")
+)
+
+history <- model %>% fit(
+  x_train, y_train,
+  epochs           = 50,
+  batch_size       = 64,
+  validation_split = 0.2,
+  verbose          = 1
+)
+```
+
+### Training History Plot
+
+```{r nn-history-plot, fig.width=8, fig.height=5}
+plot(history,
+     main = "Neural Network Training History",
+     smooth = FALSE)
+```
+
+---
+
+## Prediction & Threshold Optimization (ROC / Youden)
+
+Rather than defaulting to a 0.5 probability threshold, we use the **ROC curve** and **Youden's J statistic** to find the optimal classification threshold that maximizes the balance between Sensitivity (recall of leavers) and Specificity (recall of stayers).
+
+```{r nn-predict}
+predictions_prob <- model %>% predict(x_test)
+cat("Sample predicted probabilities:\n")
+head(predictions_prob)
+```
+
+### ROC Curve
+
+```{r nn-roc, fig.width=7, fig.height=6}
+roc_obj <- roc(as.vector(y_test), as.vector(predictions_prob))
+
+plot(roc_obj,
+     main  = "ROC Curve: HR Employee Turnover (Neural Network)",
+     col   = "#e67e22",
+     lwd   = 4,
+     print.auc = TRUE)
+```
+
+### Optimal Threshold via Youden's J Statistic
+
+```{r nn-threshold}
+best_threshold <- coords(roc_obj, "best",
+                         ret         = "threshold",
+                         best.method = "youden")
+cat("Optimal Classification Threshold:", round(best_threshold$threshold, 4), "\n")
+```
+
+### Final Predictions & Confusion Matrix
+
+```{r nn-confusion}
+predictions_final <- ifelse(predictions_prob > best_threshold$threshold, 1, 0)
+
+conf_nn <- table(Actual = as.vector(y_test),
+                 Predicted = as.vector(predictions_final))
+conf_nn
+```
+
+### Accuracy Calculation
+
+```{r nn-accuracy}
+Accuracy_nn <- sum(diag(conf_nn)) / sum(conf_nn)
+cat("Neural Network Accuracy:", round(Accuracy_nn * 100, 2), "%\n")
+```
+
+---
+
+# Summary & Model Comparison
+
+```{r comparison}
+cat("=== Model Performance Summary ===\n")
+cat(sprintf("Decision Tree Accuracy : %.2f%%\n", Accuracy_dt * 100))
+cat(sprintf("Neural Network Accuracy: %.2f%%\n", Accuracy_nn * 100))
+cat(sprintf("Neural Network AUC     : %.4f\n", auc(roc_obj)))
+```
+
+| Model | Accuracy | Notes |
+|-------|----------|-------|
+| Decision Tree (default cp) | `r paste0(round(Accuracy_dt * 100, 2), "%")` | Interpretable; visible split rules |
+| Neural Network (Keras) | `r paste0(round(Accuracy_nn * 100, 2), "%")` | Non-linear; optimized threshold via ROC |
+
+**Key Observations:**
+
+1. **Decision Trees** offer high interpretability — you can trace exactly which features drive a prediction at each node. The top splits (satisfaction level, number of projects) align with domain knowledge about employee burnout.
+
+2. **Neural Networks** learn non-linear combinations of all features simultaneously, often achieving higher accuracy on tabular data with complex interactions. The ROC-based threshold optimization ensures we are not naively defaulting to 0.5.
+
+3. **Gini Impurity and Entropy** are both valid split criteria for decision trees. The choice of cp (complexity parameter) is critical to balance fit vs. generalization.
+
+4. **Scaling is non-negotiable for Neural Networks** — without Min-Max normalization, gradient descent converges poorly, and features with large numeric ranges dominate the weight updates.
+
+---
+
+*End of Analysis*
